@@ -1587,12 +1587,15 @@ Continue EXACTLY from where you stopped. DO NOT repeat any content already gener
             const toolChoice = body.tool_choice;
             const TOOL_CHOICE_MAX_RETRIES = 2;
             let toolChoiceRetry = 0;
+            /** 发生过 tool_choice 强制重试且首轮已混合流式输出时，需补发重试轮次的正文（见下方 cleanText 分支） */
+            let toolChoiceDidRetry = false;
             while (
                 toolChoice?.type === 'any' &&
                 toolCalls.length === 0 &&
                 toolChoiceRetry < TOOL_CHOICE_MAX_RETRIES
             ) {
                 toolChoiceRetry++;
+                toolChoiceDidRetry = true;
                 log.warn('Handler', 'retry', `tool_choice=any 但模型未调用工具（第${toolChoiceRetry}次），强制重试`);
 
                 // ★ 增强版强制消息：包含可用工具名 + 具体格式示例
@@ -1653,8 +1656,8 @@ Please go ahead and pick the most appropriate tool for the current task and outp
                 }
 
                 // Any clean text is sent as a single block before the tool blocks
-                // ★ 如果混合流式已经发送了文字，跳过重复发送
-                if (!hybridAlreadySentText) {
+                // ★ 首轮已混合流式输出时通常跳过，避免重复；但若中间做过 tool_choice 重试，重试轮的正文从未被流式发送，必须补发
+                if (!hybridAlreadySentText || toolChoiceDidRetry) {
                     const unsentCleanText = cleanText.substring(sentText.length).trim();
 
                     if (unsentCleanText) {
@@ -1707,8 +1710,8 @@ Please go ahead and pick the most appropriate tool for the current task and outp
             } else {
                 // False alarm! The tool triggers were just normal text. 
                 // We must send the remaining unsent fullResponse.
-                // ★ 如果混合流式已发送部分文字，只发送未发送的部分
-                if (!hybridAlreadySentText) {
+                // ★ 如果混合流式已发送部分文字，只发送未发送的部分；tool_choice 重试后须发送重试轮的完整正文
+                if (!hybridAlreadySentText || toolChoiceDidRetry) {
                     let textToSend = fullResponse;
 
                     // ★ 仅对短响应或开头明确匹配拒绝模式的响应进行压制
