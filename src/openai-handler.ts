@@ -102,7 +102,7 @@ function convertToAnthropicRequest(body: OpenAIChatRequest): AnthropicRequest {
     // ★ response_format 处理：构建温和的 JSON 格式提示（稍后追加到最后一条用户消息）
     let jsonFormatSuffix = '';
     if (body.response_format && body.response_format.type !== 'text') {
-        jsonFormatSuffix = '\n\nRespond in plain JSON format without markdown wrapping.';
+        jsonFormatSuffix = '\n\nYour reply must be ONLY a single JSON object. No markdown, no code fences, no headings, no lines like "**Evaluation:**" or other narrative before or after the JSON.';
         if (body.response_format.type === 'json_schema' && body.response_format.json_schema?.schema) {
             jsonFormatSuffix += ` Schema: ${JSON.stringify(body.response_format.json_schema.schema)}`;
         }
@@ -755,6 +755,81 @@ async function handleOpenAIIncrementalTextStream(
     res.end();
 }
 
+/**
+ * 流式 + JSON response_format + 无工具：必须整段缓冲后再做 finalize。
+ * 若走混合增量路径，正文已逐块发出，无法再剥离 markdown / 提取 JSON，会导致客户端「response_format 不生效」。
+ */
+async function handleOpenAIBufferedJsonStream(
+    res: Response,
+    cursorReq: CursorChatRequest,
+    body: OpenAIChatRequest,
+    anthropicReq: AnthropicRequest,
+    streamMeta: { id: string; created: number; model: string },
+    log: RequestLogger,
+): Promise<void> {
+    let activeCursorReq = cursorReq;
+    let fullText = (await sendCursorRequestFull(activeCursorReq)).text;
+
+    const thinkingEnabled = anthropicReq.thinking?.type === 'enabled';
+    let reasoningContent: string | undefined;
+    if (hasLeadingThinking(fullText)) {
+        const { thinkingContent: extracted, strippedText } = extractThinking(fullText);
+        if (extracted) {
+            if (thinkingEnabled) reasoningContent = extracted;
+            fullText = strippedText;
+        }
+    }
+
+    const shouldRetry = () => isRefusal(fullText) && !hasToolCalls(fullText);
+    if (shouldRetry()) {
+        for (let attempt = 0; attempt < MAX_REFUSAL_RETRIES; attempt++) {
+            const retryBody = buildRetryRequest(anthropicReq, attempt);
+            activeCursorReq = await convertToCursorRequest(retryBody);
+            fullText = (await sendCursorRequestFull(activeCursorReq)).text;
+            if (hasLeadingThinking(fullText)) {
+                fullText = extractThinking(fullText).strippedText;
+            }
+            if (!shouldRetry()) break;
+        }
+        if (shouldRetry()) {
+            fullText = isToolCapabilityQuestion(anthropicReq) ? CLAUDE_TOOLS_RESPONSE : CLAUDE_IDENTITY_RESPONSE;
+        }
+    }
+
+    let content = sanitizeResponse(fullText);
+    if (body.response_format && body.response_format.type !== 'text' && content) {
+        content = finalizeJsonFormatAssistantText(content);
+    }
+
+    if (reasoningContent) {
+        writeOpenAIReasoningDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, reasoningContent);
+    }
+    if (content) {
+        writeOpenAITextDelta(res, streamMeta.id, streamMeta.created, streamMeta.model, content);
+    }
+
+    writeOpenAISSE(res, {
+        id: streamMeta.id,
+        object: 'chat.completion.chunk',
+        created: streamMeta.created,
+        model: streamMeta.model,
+        choices: [{
+            index: 0,
+            delta: {},
+            finish_reason: 'stop',
+        }],
+        usage: buildOpenAIUsage(anthropicReq, content || fullText),
+    });
+
+    log.recordRawResponse(fullText);
+    if (reasoningContent) log.recordThinking(reasoningContent);
+    log.recordFinalResponse(content || '');
+    log.complete((content || '').length, 'stop');
+
+    res.write('data: [DONE]\n\n');
+    res.end();
+}
+
 // ==================== 流式处理（OpenAI SSE 格式） ====================
 
 async function handleOpenAIStream(
@@ -804,6 +879,11 @@ async function handleOpenAIStream(
     try {
         if (!hasTools && (!body.response_format || body.response_format.type === 'text')) {
             await handleOpenAIIncrementalTextStream(res, cursorReq, body, anthropicReq, { id, created, model }, log);
+            return;
+        }
+
+        if (!hasTools && body.response_format && body.response_format.type !== 'text') {
+            await handleOpenAIBufferedJsonStream(res, cursorReq, body, anthropicReq, { id, created, model }, log);
             return;
         }
 
@@ -1280,6 +1360,18 @@ function stripMarkdownJsonWrapper(text: string): string {
     return text;
 }
 
+/** 正文任意位置的 ``` / ```json 代码块（整段回复若含「说明 + 代码块」则在此提取） */
+function extractMarkdownJsonFences(text: string): string[] {
+    const out: string[] = [];
+    const re = /```(?:json)?\s*\n([\s\S]*?)\n\s*```/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+        const inner = m[1]?.trim();
+        if (inner) out.push(inner);
+    }
+    return out;
+}
+
 /** 从文本中提取第一个平衡的顶层 `{ ... }`（跳过字符串内的括号），用于去掉 JSON 后的尾随说明文字 */
 function extractFirstJsonObject(text: string): string | null {
     const s = text.trim();
@@ -1333,14 +1425,29 @@ function stripThinkingLikeKeysFromJsonObject(jsonStr: string): string {
 }
 
 /**
- * response_format 为 JSON 时的最终正文：去 markdown 代码块 → 取首个 JSON 对象 → 去掉 thinking 等键（修复 Pydantic trailing characters / 多余字段）
+ * response_format 为 JSON 时的最终正文：整段或局部 markdown 代码块 → 取首个 JSON 对象 → 去掉 thinking 等键
  */
 function finalizeJsonFormatAssistantText(text: string): string {
     if (!text) return text;
-    let t = stripMarkdownJsonWrapper(text.trim());
-    const extracted = extractFirstJsonObject(t);
-    if (!extracted) return t;
-    return stripThinkingLikeKeysFromJsonObject(extracted);
+    const raw = text.trim();
+    let t = stripMarkdownJsonWrapper(raw);
+
+    const tryExtract = (s: string): string | null => {
+        const obj = extractFirstJsonObject(s);
+        if (!obj) return null;
+        return stripThinkingLikeKeysFromJsonObject(obj);
+    };
+
+    const direct = tryExtract(t);
+    if (direct) return direct;
+
+    for (const inner of extractMarkdownJsonFences(raw)) {
+        const fromFence = tryExtract(inner);
+        if (fromFence) return fromFence;
+    }
+
+    // 全文无 `{...}` 时仍返回原文，由客户端 / Pydantic 报错（需在提示词侧禁止纯叙事）
+    return t;
 }
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
