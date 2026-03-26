@@ -1077,7 +1077,7 @@ async function handleOpenAIStream(
                 let sanitized = sanitizeResponse(fullResponse);
                 // ★ response_format 后处理：剥离 markdown 代码块包裹
                 if (body.response_format && body.response_format.type !== 'text') {
-                    sanitized = stripMarkdownJsonWrapper(sanitized);
+                    sanitized = finalizeJsonFormatAssistantText(sanitized);
                 }
                 if (sanitized) {
                     writeOpenAISSE(res, {
@@ -1232,7 +1232,7 @@ async function handleOpenAINonStream(
         content = sanitizeResponse(fullText);
         // ★ response_format 后处理：剥离 markdown 代码块包裹
         if (body.response_format && body.response_format.type !== 'text' && content) {
-            content = stripMarkdownJsonWrapper(content);
+            content = finalizeJsonFormatAssistantText(content);
         }
     }
 
@@ -1278,6 +1278,69 @@ function stripMarkdownJsonWrapper(text: string): string {
         return match[1].trim();
     }
     return text;
+}
+
+/** 从文本中提取第一个平衡的顶层 `{ ... }`（跳过字符串内的括号），用于去掉 JSON 后的尾随说明文字 */
+function extractFirstJsonObject(text: string): string | null {
+    const s = text.trim();
+    const start = s.indexOf('{');
+    if (start === -1) return null;
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < s.length; i++) {
+        const c = s[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (inString) {
+            if (c === '\\') {
+                escape = true;
+                continue;
+            }
+            if (c === '"') inString = false;
+            continue;
+        }
+        if (c === '"') {
+            inString = true;
+            continue;
+        }
+        if (c === '{') depth++;
+        else if (c === '}') {
+            depth--;
+            if (depth === 0) return s.slice(start, i + 1);
+        }
+    }
+    return null;
+}
+
+const JSON_THINKING_LIKE_KEYS = ['thinking', 'reasoning', 'reasoning_content', 'analysis', 'reflection'] as const;
+
+/** 解析 JSON 对象并移除常见「思考链」字段，供 strict Agent JSON 使用 */
+function stripThinkingLikeKeysFromJsonObject(jsonStr: string): string {
+    try {
+        const obj = JSON.parse(jsonStr) as unknown;
+        if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return jsonStr;
+        const o = obj as Record<string, unknown>;
+        for (const k of JSON_THINKING_LIKE_KEYS) {
+            if (k in o) delete o[k];
+        }
+        return JSON.stringify(obj);
+    } catch {
+        return jsonStr;
+    }
+}
+
+/**
+ * response_format 为 JSON 时的最终正文：去 markdown 代码块 → 取首个 JSON 对象 → 去掉 thinking 等键（修复 Pydantic trailing characters / 多余字段）
+ */
+function finalizeJsonFormatAssistantText(text: string): string {
+    if (!text) return text;
+    let t = stripMarkdownJsonWrapper(text.trim());
+    const extracted = extractFirstJsonObject(t);
+    if (!extracted) return t;
+    return stripThinkingLikeKeysFromJsonObject(extracted);
 }
 
 function writeOpenAISSE(res: Response, data: OpenAIChatCompletionChunk): void {
